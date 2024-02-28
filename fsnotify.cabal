@@ -45,6 +45,7 @@ library
     , text >=0.11.0
     , time >=1.1
     , unix-compat >=0.2
+    , unordered-containers >=0.2
   default-language: Haskell2010
   if os(linux)
     cpp-options: -DOS_Linux
@@ -114,3 +115,8 @@ test-suite tests
   else
     build-depends:
         sandwich
+
+executable fsnotify-rename-test
+  main-is: RenameTest.hs
+  build-depends:
+      fsnotify, base, directory, filepath

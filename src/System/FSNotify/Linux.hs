@@ -19,19 +19,26 @@ module System.FSNotify.Linux (
   , NativeManager
   ) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Exception.Safe as E
 import Control.Monad
 import qualified Data.ByteString as BS
 import Data.Function
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HashMap
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Monoid
 import Data.String
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, secondsToNominalDiffTime)
 import Data.Time.Clock.POSIX
 import qualified GHC.Foreign as F
 import GHC.IO.Encoding (getFileSystemEncoding)
 import Prelude hiding (FilePath)
 import System.Directory (canonicalizePath)
+import System.IO.Error (isDoesNotExistErrorType, ioeGetErrorType)
 import System.FSNotify.Find
 import System.FSNotify.Listener
 import System.FSNotify.Types
@@ -117,50 +124,141 @@ instance FileListener INotifyListener () where
     -- we've stopped listening), we replace the MVar contents with Nothing
     -- to signify that the listening task is cancelled, and no new watches
     -- should be added.
-    wdVar <- newMVar (Just [])
+    wdVar <- newMVar (Just mempty)
+
+    -- movedDirectories stores watched directories that were moved out of
+    -- a watched directory, these are removed after they have been moved
+    -- for movedCookieTimeout and not move in to a watched directory
+    let
+      movedCookieTimeout = secondsToNominalDiffTime 1
+      movedFilterDelay = 1000000 -- 1 second
+    movedDirectories <- newMVar Map.empty
+
+    filterThread <- async $ forever $ do
+      threadDelay movedFilterDelay
+      filterMovedDirs movedDirectories movedCookieTimeout
 
     let
-      removeWatches wds = forM_ wds $ \(wd, watchStillExistsVar) ->
-        modifyMVar_ watchStillExistsVar $ \wse -> do
+      removeWatches wds = forM_ wds $ \watched ->
+        modifyMVar_ (watchedStillExists watched) $ \wse -> do
+          let wd = watchedDescriptor watched
           when wse $
             handle (\(e :: SomeException) -> putStrLn ("Error removing watch: " <> show wd <> " (" <> show e <> ")"))
                    (INo.removeWatch wd)
           return False
 
-      stopListening = modifyMVar_ wdVar $ \x -> maybe (return ()) removeWatches x >> return Nothing
+      stopListening = do
+        cancel filterThread
+        modifyMVar_ wdVar $ \x -> maybe (return ()) removeWatches x >> return Nothing
 
     -- Add watches to this directory plus every sub-directory
     rawInitialPath <- toRawFilePath initialPath
     rawCanonicalInitialPath <- canonicalizeRawDirPath rawInitialPath
-    watchDirectoryRecursively listener wdVar actPred callback True rawCanonicalInitialPath
+    watchDirectoryRecursively listener wdVar movedDirectories actPred callback True rawCanonicalInitialPath
     traverseAllDirs rawCanonicalInitialPath $ \subPath ->
-      watchDirectoryRecursively listener wdVar actPred callback False subPath
+      watchDirectoryRecursively listener wdVar movedDirectories actPred callback False subPath
 
     return stopListening
 
+data WatchedDirectory = WatchedDirectory {
+  watchedDescriptor :: INo.WatchDescriptor
+, watchedStillExists :: MVar Bool -- ^ Set to False when the watch is removed
+, watchedPath :: MVar RawFilePath -- ^ The path of the directory being watched
+}
 
-type RecursiveWatches = MVar (Maybe [(INo.WatchDescriptor, MVar Bool)])
+type RecursiveWatches = MVar (Maybe (HashMap RawFilePath WatchedDirectory))
 
-watchDirectoryRecursively :: INotifyListener -> RecursiveWatches -> ActionPredicate -> EventCallback -> Bool -> RawFilePath -> IO ()
-watchDirectoryRecursively listener@(INotifyListener {listenerINotify}) wdVar actPred callback isRootWatchedDir rawFilePath = do
+-- | Remove a watched directory from the list of watched directories
+removeWatchedDir :: RecursiveWatches -> RawFilePath -> IO (Maybe WatchedDirectory)
+removeWatchedDir watchedDirectories dir =
+  modifyMVar watchedDirectories $ return . maybe (Nothing, Nothing) (\watches ->  (Just $ HashMap.delete dir watches, HashMap.lookup dir watches))
+
+-- | Directories moved out of a watched directory and the time they were moved
+type MovedDirectories = MVar (Map INo.Cookie (UTCTime, WatchedDirectory))
+
+addMovedDir :: MovedDirectories -> INo.Cookie -> WatchedDirectory -> IO ()
+addMovedDir movedDirectories cookie dirRef = do
+  movedTime <- getCurrentTime
+  modifyMVar movedDirectories $ \m -> return (Map.insert cookie (movedTime, dirRef) m, ())
+
+removeMovedDir :: MovedDirectories -> INo.Cookie -> IO (Maybe WatchedDirectory)
+removeMovedDir movedDirectories cookie =
+  modifyMVar movedDirectories $ \m -> return (Map.delete cookie m, snd <$> Map.lookup cookie m)
+
+filterMovedDirs :: MovedDirectories -> NominalDiffTime -> IO ()
+filterMovedDirs movedDirectories offset = do
+  currentTime <- getCurrentTime
+  modifyMVar movedDirectories $ \m -> return (Map.filter (\(movedTime, _) -> addUTCTime offset movedTime >= currentTime) m, ())
+
+watchDirectoryRecursively :: INotifyListener -> RecursiveWatches -> MovedDirectories -> ActionPredicate -> EventCallback -> Bool -> RawFilePath -> IO ()
+watchDirectoryRecursively listener@(INotifyListener {listenerINotify}) wdVar movedDirectories actPred callback isRootWatchedDir rawFilePath = do
   modifyMVar_ wdVar $ \case
     Nothing -> return Nothing
     Just wds -> do
       watchStillExistsVar <- newMVar True
       hinotifyPath <- rawToHinotifyPath rawFilePath
-      wd <- INo.addWatch listenerINotify varieties hinotifyPath (handleRecursiveEvent rawFilePath actPred callback watchStillExistsVar isRootWatchedDir listener wdVar)
-      return $ Just ((wd, watchStillExistsVar):wds)
+      dirRef <- newMVar hinotifyPath
+      let hanlder = handleRecursiveEvent movedDirectories dirRef actPred callback watchStillExistsVar isRootWatchedDir listener wdVar
+      -- Attempt to add a watch to the directory, if the directory doesn't exist
+      -- because it was deleted or moved after the event is fired then the addWatch will throw an exception
+      ewd <- try $ INo.addWatch listenerINotify varieties hinotifyPath hanlder
+      case ewd of
+        Left e
+          | isDoesNotExistErrorType (ioeGetErrorType e) -> do
+              return $ Just wds
+          | otherwise -> throwIO e
+        Right wd -> return $ Just $ HashMap.insert rawFilePath (WatchedDirectory wd watchStillExistsVar dirRef) wds
 
-
-handleRecursiveEvent :: RawFilePath -> ActionPredicate -> EventCallback -> MVar Bool -> Bool -> INotifyListener -> RecursiveWatches -> INo.Event -> IO ()
-handleRecursiveEvent baseDir actPred callback watchStillExistsVar isRootWatchedDir listener wdVar event = do
+handleRecursiveEvent :: MovedDirectories -> MVar RawFilePath -> ActionPredicate -> EventCallback -> MVar Bool -> Bool -> INotifyListener -> RecursiveWatches -> INo.Event -> IO ()
+handleRecursiveEvent movedDirectories dirRef actPred callback watchStillExistsVar isRootWatchedDir listener wdVar event = do
   case event of
-    (INo.Created True hiNotifyPath) -> do
+    INo.DeletedSelf ->
+      -- The watched directory was removed, mark the watch as already removed
+      modifyMVar_ watchStillExistsVar $ const $ return False
+    (INo.Created True hiNotifyPath) ->
+      -- A new directory was created, add watches to it
+      watchNewDirectory hiNotifyPath
+    INo.MovedOut True hiNotifyPath cookie -> do
+      baseDir <- readMVar dirRef
+      let movedOutDir = baseDir <//> hiNotifyPath
+      -- Directory was moved out, empty base directory reference because any events from this directory would be from an unknown location
+      removeWatchedDir wdVar movedOutDir >>= \case
+        Nothing -> return () -- Something went wrong, the directory was moved out but there is no reference to it
+        Just movedOutDirRef -> do
+          -- 
+          _ <- takeMVar $ watchedPath movedOutDirRef
+          -- Add the base directory reference to a map with the cookie as a key so it can be retrieved if the directory is moved into another directory that is being watched
+          addMovedDir movedDirectories cookie movedOutDirRef
+    INo.MovedIn True hiNotifyPath cookie -> do
+      baseDir <- readMVar dirRef
+      let movedInDir = baseDir <//> hiNotifyPath
+      -- Directory was moved in, add the base directory reference back to the map
+      removeMovedDir movedDirectories cookie >>= \case
+        Just movedWatch ->
+          -- The directory was moved out of a watched directory and already has watches set up
+          -- Only need to update the directory reference
+          putMVar (watchedPath movedWatch) movedInDir
+        Nothing -> 
+          -- The directory was moved in from an unknown location, set up watches for it like a new directory
+          -- A new directory was created, so add recursive inotify watches to it
+          watchNewDirectory hiNotifyPath
+    _ -> return ()
+
+  -- Forward the event. Ignore a DeletedSelf if we're not on the root directory,
+  -- since the watch above us will pick up the delete of that directory.
+  case event of
+    INo.DeletedSelf | not isRootWatchedDir -> return ()
+    _ -> do
+      baseDir <- readMVar dirRef
+      handleInoEvent actPred callback baseDir watchStillExistsVar event
+  where
+    watchNewDirectory hInotifyPath = do
+      baseDir <- readMVar dirRef
       -- A new directory was created, so add recursive inotify watches to it
-      rawDirPath <- rawFromHinotifyPath hiNotifyPath
+      rawDirPath <- rawFromHinotifyPath hInotifyPath
       let newRawDir = baseDir <//> rawDirPath
       timestampBeforeAddingWatch <- getPOSIXTime
-      watchDirectoryRecursively listener wdVar actPred callback False newRawDir
+      watchDirectoryRecursively listener wdVar movedDirectories actPred callback False newRawDir
 
       newDir <- fromRawFilePath newRawDir
 
@@ -175,21 +273,6 @@ handleRecursiveEvent baseDir actPred callback watchStillExistsVar isRootWatchedD
           let isDir = if isDirectory fileStatus then IsDirectory else IsFile
           let addedEvent = (Added (newDir </> newPath) (posixSecondsToUTCTime timestampBeforeAddingWatch) isDir)
           when (actPred addedEvent) $ callback addedEvent
-
-    _ -> return ()
-
-  -- If the watched directory was removed, mark the watch as already removed
-  case event of
-    INo.DeletedSelf -> modifyMVar_ watchStillExistsVar $ const $ return False
-    _ -> return ()
-
-  -- Forward the event. Ignore a DeletedSelf if we're not on the root directory,
-  -- since the watch above us will pick up the delete of that directory.
-  case event of
-    INo.DeletedSelf | not isRootWatchedDir -> return ()
-    _ -> handleInoEvent actPred callback baseDir watchStillExistsVar event
-
-
 
 -- * Util
 
